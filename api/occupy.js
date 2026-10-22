@@ -53,6 +53,26 @@ async function pool(items, size, fn) {
 const art = new Map()
 let cached = null
 
+// The curated Legendary Canvases, one entry per artwork: neighbouring canvases by the same artist are
+// one piece (Coldie's is two canvases side by side). Each canvas's current art, as hex.
+async function legendaryArt() {
+  const data = await json('/rarity/legendary')
+  const rows = (data?.current ?? []).filter((r) => Number.isInteger(Number(r?.id)))
+  const works = []
+  for (const r of rows) {
+    const artist = String(r.artist ?? '').trim() || `Normie #${r.id}`
+    const last = works[works.length - 1]
+    if (last && last.artist === artist) last.ids.push(Number(r.id))
+    else works.push({ artist, ids: [Number(r.id)] })
+  }
+  const out = await pool(works, 6, async (w) => {
+    const bits = await Promise.all(w.ids.map((id) => text(`/normie/${id}/pixels`)))
+    if (bits.some((b) => !b || b.length !== 1600)) return null
+    return { artist: w.artist, ids: w.ids, size: 40, art: bits.map(toHex) }
+  })
+  return out.filter(Boolean)
+}
+
 async function build() {
   const latest = new Map()
   for (let p = 0; p < MAX_PAGES; p++) {
@@ -82,7 +102,7 @@ async function build() {
     return item
   })).filter(Boolean)
 
-  return { updatedAt: Date.now(), total: items.length, items }
+  return { updatedAt: Date.now(), total: items.length, items, legendary: await legendaryArt() }
 }
 
 export default async function handler(req, res) {

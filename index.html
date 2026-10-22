@@ -41,15 +41,16 @@ canvas { display: block; width: 100vw; height: 100vh; }
   // before → being repainted → on chain → every Normie repainted.
   //   wall: canvas replay + gallery · before: the art as it was · focus: the replay ·
   //   after: the art as it lives on chain · mosaic: the whole gallery
-  var MODES = { wall: 1, before: 1, focus: 1, after: 1, mosaic: 1 }
+  // The cube: side 1 the Legendary Canvases, side 2 customized Normies being repainted, sides 3 and
+  // 4 open canvases for visitors to paint live.
+  var MODES = { wall: 1, before: 1, focus: 1, after: 1, mosaic: 1, legendary: 1, paint: 1 }
   function layout() {
     var forced = (Q.get('mode') || '').toLowerCase()
     if (MODES[forced]) return forced
     if (SURFACE === 'entrance-led') return 'wall'
-    if (SURFACE === 'cube-1') return 'before'
+    if (SURFACE === 'cube-1') return 'legendary'
     if (SURFACE === 'cube-2') return 'focus'
-    if (SURFACE === 'cube-3') return 'after'
-    if (SURFACE === 'cube-4') return 'mosaic'
+    if (SURFACE === 'cube-3' || SURFACE === 'cube-4') return 'paint'
     return W / H >= 1.4 ? 'wall' : 'focus'
   }
 
@@ -76,11 +77,20 @@ canvas { display: block; width: 100vw; height: 100vh; }
     return (tiles[it.id + ':' + it.ts] = c)
   }
   // the grids hold customized Normies only, straight from the Normies API
+  var legendary = [] // [{ artist, ids, size, arts: [Uint8Array] }], one per artwork
+  function acceptLegendary(list) {
+    if (!Array.isArray(list) || !list.length) return
+    legendary = list.map(function (l) {
+      return { artist: l.artist, ids: l.ids, size: l.size, arts: l.art.map(function (h) { return hexBits(h, l.size) }) }
+    })
+  }
   function merge() {
     items = onchain.slice().sort(function (a, b) { return b.ts - a.ts })
+    playlist = items.filter(function (it) { return it.changes.length >= MIN_CHANGES })
     mosaicKey = ''
   }
   function accept(data) {
+    if (data) acceptLegendary(data.legendary)
     if (!data || !Array.isArray(data.items) || !data.items.length) return
     onchain = data.items.map(function (it) {
       it.kind = 'chain'
@@ -179,12 +189,17 @@ canvas { display: block; width: 100vw; height: 100vh; }
       if (t - spotlight.t0 < CYCLE) return { it: spotlight.it, idx: items.indexOf(spotlight.it), p: (t - spotlight.t0) / CYCLE }
       spotlight = null
     }
-    var n = Math.max(1, Math.min(items.length, PLAYLIST))
-    var idx = Math.floor(t / CYCLE) % n
-    return { it: items[idx], idx: idx, p: (t % CYCLE) / CYCLE }
+    var list = playlist.length ? playlist : items
+    var n = Math.max(1, Math.min(list.length, PLAYLIST))
+    var it = list[Math.floor(t / CYCLE) % n]
+    return { it: it, idx: items.indexOf(it), p: (t % CYCLE) / CYCLE }
   }
   var fitCount = 0
   var PLAYLIST = 120 // newest edits on the clock; the same number on every surface keeps them in step
+  // Edits of a pixel or two look the same before and after on the cube, so the clock only plays
+  // Normies with a visible repaint. Every customized Normie still shows in the grids.
+  var MIN_CHANGES = Number(Q.get('min')) || 12
+  var playlist = []
 
   // ── the canvas being repainted ────────────────────────────────────────────
   // 0–.08 the art as it was · .08–.62 each changed pixel lands, added green, removed grey (the
@@ -458,7 +473,7 @@ canvas { display: block; width: 100vw; height: 100vh; }
       drawEditing(cx, cy, s)
       var left = Math.max(0, Math.ceil((IDLE_MS - (Date.now() - ed.last)) / 1000))
       var n = changedCount()
-      text('YOUR TURN', cx, cy + s + cap * 0.38, u * 0.26, ADD, 'left', 700, u * 0.03)
+      text(n ? 'YOUR TURN' : 'PAINT HERE', cx, cy + s + cap * 0.38, u * 0.26, ADD, 'left', 700, u * 0.03)
       var info = (ed.from ? 'REPAINTING ' + ed.from : 'BLANK CANVAS') + ' · CLICK A PIXEL TO ADD OR REMOVE IT · ' + n + ' CHANGED' + (left <= 15 ? ' · SAVING IN ' + left : '')
       text(info, cx, cy + s + cap * 0.72, fit(info, s * 0.5, u * 0.15, 600), 'rgba(227,229,228,0.6)', 'left', 600)
       var bfs = u * 0.2, bhh = cap * 0.5, bx = cx + s
@@ -551,7 +566,7 @@ canvas { display: block; width: 100vw; height: 100vh; }
       if (p.x >= h.x && p.y >= h.y && p.x <= h.x + h.w && p.y <= h.y + h.h) { h.fn(); return }
     }
     // a click anywhere else on a screen that shows no editor opens one
-    if (!ed && items.length && layout() !== 'wall') startEditing(now())
+    if (!ed && items.length && layout() !== 'wall' && layout() !== 'legendary') startEditing(now())
   })
   cv.addEventListener('pointermove', function (e) {
     mouseSeen = true
@@ -606,6 +621,35 @@ canvas { display: block; width: 100vw; height: 100vh; }
     text(line, x, y + s + cap * 0.75, fs * 0.8, 'rgba(227,229,228,0.55)', 'left', 600, fs * 0.05)
     text('NORMIES.ART', x + s, y + s + cap * 0.75, fs * 0.8, 'rgba(227,229,228,0.35)', 'right', 600, fs * 0.08)
   }
+  // one Legendary Canvas at a time, six seconds each; Coldie's piece is two canvases side by side
+  function renderLegendary() {
+    var m = Math.min(W, H), fs = m * 0.032
+    if (!legendary.length) {
+      text('LEGENDARY CANVASES', W / 2, H / 2, fs, 'rgba(227,229,228,0.4)', 'center', 700, fs * 0.15)
+      return
+    }
+    var EACH = CYCLE / 2, t = Date.now()
+    var i = Math.floor(t / EACH) % legendary.length, p = (t % EACH) / EACH
+    var L = legendary[i]
+    var head = m * 0.08, foot = m * 0.15
+    var s = Math.min(W * 0.84, H - head - foot - m * 0.04)
+    var x = (W - s) / 2, y = (H - s - head - foot) / 2 + head
+    var a = Math.min(1, p / 0.08, (1 - p) / 0.08)
+    ctx.save(); ctx.globalAlpha = Math.max(0, a)
+    ctx.fillStyle = PAPER; ctx.fillRect(x, y, s, s)
+    var n = L.arts.length, w = s / n
+    L.arts.forEach(function (bits, k) { drawBits(bits, L.size, x + k * w, y + (s - w) / 2, w) })
+    ctx.restore()
+    ctx.fillStyle = GLOW; ctx.fillRect(x, y - head * 0.62, fs * 0.6, fs * 0.6)
+    text('LEGENDARY CANVAS', x + fs, y - head * 0.38, fs, PAPER, 'left', 700, fs * 0.12)
+    text((i + 1) + ' / ' + legendary.length, x + s, y - head * 0.38, fs, 'rgba(227,229,228,0.5)', 'right', 700, fs * 0.06)
+    ctx.save(); ctx.globalAlpha = Math.max(0, a)
+    var name = L.artist.toUpperCase()
+    text(name, x, y + s + foot * 0.52, fit(name, s, m * 0.075, 700), PAPER, 'left', 700, m * 0.004)
+    text('NORMIE ' + L.ids.map(function (d) { return '#' + d }).join(' + '), x, y + s + foot * 0.85, fs * 0.8, 'rgba(227,229,228,0.55)', 'left', 600, fs * 0.08)
+    ctx.restore()
+    text('NORMIES.ART', x + s, y + s + foot * 0.85, fs * 0.8, 'rgba(227,229,228,0.35)', 'right', 600, fs * 0.08)
+  }
   function renderMosaic(cur) {
     var pad = Math.min(W, H) * 0.03
     drawMosaic(pad, pad, W - pad * 2, H - pad * 2, cur)
@@ -623,7 +667,12 @@ canvas { display: block; width: 100vw; height: 100vh; }
   function frame() {
     HITS = []
     ctx.fillStyle = INK; ctx.fillRect(0, 0, W, H)
-    if (ed && layout() !== 'wall') {
+    var lay = layout()
+    // the paint sides always hold an open canvas, except while a finished drawing replays
+    if (lay === 'paint' && !ed && !spotlight) startEditing()
+    if (lay === 'legendary') {
+      renderLegendary()
+    } else if (ed && lay !== 'wall') {
       var m = Math.min(W, H), u = Math.min(W / 9, H / 10)
       var pw = Math.min(W - m * 0.06, (H - m * 0.06) * 0.9)
       editorPanel(now(), (W - pw) / 2, m * 0.03, pw, H - m * 0.06, u)
@@ -634,7 +683,7 @@ canvas { display: block; width: 100vw; height: 100vh; }
       var cur = now()
       if (mode === 'wall') renderWall(cur)
       else if (mode === 'mosaic') renderMosaic(cur)
-      else renderSingle(cur, mode)
+      else renderSingle(cur, mode === 'paint' ? 'focus' : mode)
     }
     drawNotice()
     requestAnimationFrame(frame)

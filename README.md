@@ -8,12 +8,12 @@ One link runs on all five screens. NODE appends `?surface=` and the page shows s
 | `?surface=` | Screen | Shows |
 |---|---|---|
 | `entrance-led` | Entrance LED wall · 8,640 × 2,448 | The Normies Canvas editor repainting a Normie, beside the wall of every Normie repainted on-chain |
-| `cube-1` | LED cube, side 1 · 1,280 × 1,280 | The current Normie **before** its edit |
-| `cube-2` | LED cube, side 2 · 1,280 × 1,280 | The edit **happening**, pixel by pixel |
-| `cube-3` | LED cube, side 3 · 1,280 × 1,280 | The result, **as it lives on Ethereum** |
-| `cube-4` | LED cube, side 4 · 1,280 × 1,280 | The whole wall, the current Normie lit |
+| `cube-1` | LED cube, side 1 · 1,280 × 1,280 | The **Legendary Canvases**, one at a time with the artist's name |
+| `cube-2` | LED cube, side 2 · 1,280 × 1,280 | **Customized Normies** being repainted, pixel by pixel (edits of 12+ pixels) |
+| `cube-3` | LED cube, side 3 · 1,280 × 1,280 | **Live painting**: an open canvas for visitors |
+| `cube-4` | LED cube, side 4 · 1,280 × 1,280 | **Live painting**: a second open canvas |
 
-Without `?surface=` the window's shape decides (wide → wall, square → replay). `&mode=wall|focus|before|after|mosaic`
+Without `?surface=` the window's shape decides (wide → wall, square → replay). `&mode=wall|focus|legendary|paint|before|after|mosaic`
 forces a layout for testing.
 
 - **Live:** the grids show only customized Normies, from the Normies API, refreshed every minute.
@@ -25,7 +25,7 @@ forces a layout for testing.
 ## Files
 
 - `index.html`: the whole installation (one canvas, no dependencies).
-- `api/occupy.js`: `GET /api/occupy`, the customized Normies (before/after art and the changed pixels) from `api.normies.art`.
+- `api/occupy.js`: `GET /api/occupy`, the customized Normies (before/after art and the changed pixels) and the Legendary Canvases, from `api.normies.art`.
 - `server.mjs`: local preview server.
 
 ## Run locally
