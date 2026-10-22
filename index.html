@@ -1,0 +1,652 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Normies Canvas · Occupy NODE</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+html, body { margin: 0; height: 100%; overflow: hidden; background: #0e0f10; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict'
+  // ── config ────────────────────────────────────────────────────────────────
+  var Q = new URLSearchParams(location.search)
+  var SURFACE = (Q.get('surface') || '').toLowerCase()
+  var DATA_URL = Q.get('data') || '/api/occupy'
+  var API = Q.get('api') || 'https://api.normies.art' // for RANDOM: any of the living Normies
+  var IDLE_MS = 60000 // a visitor who walks away: their drawing is filed (or dropped if empty)
+  var CYCLE = Number(Q.get('cycle')) || 12000 // ms per Normie; every surface shares the clock
+  var INK = '#0e0f10', PANEL = '#1d1e20', PAPER = '#e3e5e4', STEEL = '#48494b'
+  var ADD = '#57d996', DEL = '#9a9c9b', GLOW = '#ffd27a'
+  var FONT = "'Chakra Petch', ui-monospace, Menlo, monospace"
+
+  var cv = document.getElementById('c')
+  var ctx = cv.getContext('2d')
+  var W = 0, H = 0, DPR = 1
+  var items = [] // newest first: on-chain edits and visitor drawings together
+  var onchain = [], visitors = []
+  var tiles = {} // id → offscreen canvas of the current art
+  var mosaicLayer = null, mosaicKey = ''
+
+  // ── surface → layout ──────────────────────────────────────────────────────
+  // Exhibition 1: the entrance wall is the editor + gallery; walking around the cube reads
+  // before → being repainted → on chain → every Normie repainted.
+  //   wall: canvas replay + gallery · before: the art as it was · focus: the replay ·
+  //   after: the art as it lives on chain · mosaic: the whole gallery
+  var MODES = { wall: 1, before: 1, focus: 1, after: 1, mosaic: 1 }
+  function layout() {
+    var forced = (Q.get('mode') || '').toLowerCase()
+    if (MODES[forced]) return forced
+    if (SURFACE === 'entrance-led') return 'wall'
+    if (SURFACE === 'cube-1') return 'before'
+    if (SURFACE === 'cube-2') return 'focus'
+    if (SURFACE === 'cube-3') return 'after'
+    if (SURFACE === 'cube-4') return 'mosaic'
+    return W / H >= 1.4 ? 'wall' : 'focus'
+  }
+
+  // ── data ──────────────────────────────────────────────────────────────────
+  function hexBits(hex, size) {
+    var out = new Uint8Array(size * size)
+    for (var i = 0; i < hex.length; i++) {
+      var v = parseInt(hex[i], 16)
+      for (var b = 0; b < 4; b++) {
+        var k = i * 4 + b
+        if (k < out.length) out[k] = (v >> (3 - b)) & 1
+      }
+    }
+    return out
+  }
+  function tileFor(it) {
+    if (tiles[it.id + ':' + it.ts]) return tiles[it.id + ':' + it.ts]
+    var c = document.createElement('canvas')
+    c.width = c.height = it.size
+    var x = c.getContext('2d')
+    x.fillStyle = PAPER; x.fillRect(0, 0, it.size, it.size)
+    x.fillStyle = STEEL
+    for (var i = 0; i < it.nowBits.length; i++) if (it.nowBits[i]) x.fillRect(i % it.size, (i / it.size) | 0, 1, 1)
+    return (tiles[it.id + ':' + it.ts] = c)
+  }
+  // the grids hold customized Normies only, straight from the Normies API
+  function merge() {
+    items = onchain.slice().sort(function (a, b) { return b.ts - a.ts })
+    mosaicKey = ''
+  }
+  function accept(data) {
+    if (!data || !Array.isArray(data.items) || !data.items.length) return
+    onchain = data.items.map(function (it) {
+      it.kind = 'chain'
+      it.baseBits = hexBits(it.base, it.size)
+      it.nowBits = hexBits(it.now, it.size)
+      it.changes = shuffle(it.added.map(function (i) { return [i, 1] }).concat(it.removed.map(function (i) { return [i, 0] })), it.id)
+      return it
+    })
+    merge()
+  }
+  function load() {
+    fetch(DATA_URL, { cache: 'no-store' }).then(function (r) { return r.ok ? r.json() : null }).then(accept).catch(function () {})
+  }
+  // ── visitor drawings (the /draw store: base64url, 1 bit per pixel, 40x40 or 80x80) ──
+  function b64uToBits(d) {
+    var bin = atob(d.replace(/-/g, '+').replace(/_/g, '/'))
+    var size = bin.length === 800 ? 80 : bin.length === 200 ? 40 : 0
+    if (!size) return null
+    var bits = new Uint8Array(size * size)
+    for (var i = 0; i < bits.length; i++) bits[i] = (bin.charCodeAt(i >> 3) >> (7 - (i & 7))) & 1
+    return { size: size, bits: bits }
+  }
+  function bitsToB64u(bits) {
+    var out = ''
+    for (var i = 0; i < bits.length; i += 8) {
+      var v = 0
+      for (var b = 0; b < 8; b++) v = (v << 1) | (bits[i + b] ? 1 : 0)
+      out += String.fromCharCode(v)
+    }
+    return btoa(out).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  }
+  function hashStr(str) {
+    var h = 2166136261
+    for (var i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0 }
+    return h
+  }
+  function visitorItem(d, ts, base) {
+    var dec = b64uToBits(d)
+    if (!dec) return null
+    var n = dec.size, start = base && base.length === n * n ? base : new Uint8Array(n * n)
+    var changes = []
+    for (var i = 0; i < n * n; i++) if (dec.bits[i] !== start[i]) changes.push([i, dec.bits[i]])
+    if (!changes.length) return null
+    var h = hashStr(d)
+    return { kind: 'visitor', id: 'v' + h.toString(36), d: d, ts: ts, size: n, baseBits: start, nowBits: dec.bits, changes: shuffle(changes, h) }
+  }
+
+  function shuffle(a, seed) {
+    var s = (seed * 2654435761) >>> 0
+    for (var i = a.length - 1; i > 0; i--) {
+      s = (s * 1664525 + 1013904223) >>> 0
+      var j = s % (i + 1), t = a[i]; a[i] = a[j]; a[j] = t
+    }
+    return a
+  }
+
+  // ── helpers ───────────────────────────────────────────────────────────────
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)) }
+  function seg(t, a, b) { return clamp((t - a) / (b - a), 0, 1) }
+  function text(str, x, y, size, color, align, weight, ls) {
+    ctx.font = (weight || 600) + ' ' + size + 'px ' + FONT
+    ctx.fillStyle = color || PAPER
+    ctx.textAlign = align || 'left'
+    ctx.textBaseline = 'alphabetic'
+    if ('letterSpacing' in ctx) ctx.letterSpacing = (ls || 0) + 'px'
+    ctx.fillText(str, x, y)
+    if ('letterSpacing' in ctx) ctx.letterSpacing = '0px'
+  }
+  // the font size at which str fits in maxW (never above size)
+  function fit(str, maxW, size, weight, ls) {
+    ctx.font = (weight || 600) + ' ' + size + 'px ' + FONT
+    var w = ctx.measureText(str).width + (ls || 0) * str.length
+    return w > maxW ? size * maxW / w : size
+  }
+  function ago(ts) {
+    var s = Math.max(1, Date.now() / 1000 - ts)
+    if (s < 3600) return Math.round(s / 60) + ' MIN AGO'
+    if (s < 86400) return Math.round(s / 3600) + ' H AGO'
+    return Math.round(s / 86400) + ' DAYS AGO'
+  }
+
+  function nameOf(it) { return it.kind === 'visitor' ? (it.local ? 'YOUR DRAWING' : 'DRAWN BY A VISITOR') : 'NORMIE #' + it.id }
+  function lineOf(it) {
+    var n = it.changes.length
+    return it.kind === 'visitor'
+      ? n + ' PIXEL' + (n === 1 ? '' : 'S') + ' · DRAWN HERE ON THE NORMIES CANVAS · ' + ago(it.ts)
+      : n + ' PIXEL' + (n === 1 ? '' : 'S') + ' REPAINTED ON ETHEREUM · ' + ago(it.ts)
+  }
+
+  // The playlist is the gallery as it fits on screen; all surfaces read the same clock, so a wall
+  // and two pools in the same room show the same Normie at the same moment.
+  var spotlight = null // { it, t0 }: a drawing just filed here, replayed once before the clock resumes
+  function now() {
+    var t = Date.now()
+    if (spotlight) {
+      if (t - spotlight.t0 < CYCLE) return { it: spotlight.it, idx: items.indexOf(spotlight.it), p: (t - spotlight.t0) / CYCLE }
+      spotlight = null
+    }
+    var n = Math.max(1, Math.min(items.length, PLAYLIST))
+    var idx = Math.floor(t / CYCLE) % n
+    return { it: items[idx], idx: idx, p: (t % CYCLE) / CYCLE }
+  }
+  var fitCount = 0
+  var PLAYLIST = 120 // newest edits on the clock; the same number on every surface keeps them in step
+
+  // ── the canvas being repainted ────────────────────────────────────────────
+  // 0–.08 the art as it was · .08–.62 each changed pixel lands, added green, removed grey (the
+  // editor's DIFF view) · .62–.78 hold · .78–.86 diff off: the art as it lives on chain · hold.
+  function drawReplayCells(it, p, x, y, s, opts) {
+    opts = opts || {}
+    var n = it.size, px = s / n
+    var shown = Math.floor(it.changes.length * seg(p, 0.08, 0.62))
+    var diff = p < 0.82
+    var cells = new Uint8Array(it.baseBits)
+    var mark = new Int8Array(n * n) // 1 added, -1 removed
+    for (var k = 0; k < shown; k++) {
+      var c = it.changes[k]
+      cells[c[0]] = c[1]
+      mark[c[0]] = c[1] ? 1 : -1
+    }
+    ctx.fillStyle = PAPER
+    ctx.fillRect(x, y, s, s)
+    for (var i = 0; i < n * n; i++) {
+      var m = diff ? mark[i] : 0
+      if (!cells[i]) continue // removed pixels show as empty, like the chain
+      ctx.fillStyle = m === 1 ? ADD : m === -1 ? DEL : STEEL
+      var cx = x + (i % n) * px, cy = y + ((i / n) | 0) * px
+      if (m === -1) {
+        var inset = px * 0.3
+        ctx.fillRect(Math.floor(cx + inset), Math.floor(cy + inset), Math.ceil(px - inset * 2), Math.ceil(px - inset * 2))
+      } else {
+        ctx.fillRect(Math.floor(cx), Math.floor(cy), Math.ceil(px), Math.ceil(px))
+      }
+    }
+    // the newest stroke, a beat brighter
+    if (diff && shown > 0 && shown < it.changes.length) {
+      var last = it.changes[shown - 1][0]
+      ctx.strokeStyle = GLOW; ctx.lineWidth = Math.max(1, px * 0.18)
+      ctx.strokeRect(x + (last % n) * px, y + ((last / n) | 0) * px, px, px)
+    }
+    if (opts.grid && px >= 6) {
+      ctx.strokeStyle = 'rgba(14,15,16,0.08)'; ctx.lineWidth = 1
+      ctx.beginPath()
+      for (var g = 1; g < n; g++) {
+        ctx.moveTo(Math.round(x + g * px) + 0.5, y); ctx.lineTo(Math.round(x + g * px) + 0.5, y + s)
+        ctx.moveTo(x, Math.round(y + g * px) + 0.5); ctx.lineTo(x + s, Math.round(y + g * px) + 0.5)
+      }
+      ctx.stroke()
+    }
+  }
+
+  // Pixels are drawn at whole-number size on a small offscreen canvas, then scaled up with smoothing
+  // off. Drawing fractional-size cells straight onto the screen left hairline seams between them.
+  var CELL = 12, off = document.createElement('canvas'), offCtx = off.getContext('2d')
+  function seamless(n, x, y, s, draw) {
+    var k = n * CELL
+    if (off.width !== k) { off.width = off.height = k }
+    var main = ctx
+    ctx = offCtx
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    ctx.clearRect(0, 0, k, k)
+    try { draw(k) } finally { ctx = main }
+    ctx.save()
+    ctx.imageSmoothingEnabled = false
+    ctx.drawImage(off, Math.round(x), Math.round(y), Math.round(s), Math.round(s))
+    ctx.restore()
+  }
+  function drawReplay(it, p, x, y, s, opts) { seamless(it.size, x, y, s, function (k) { drawReplayCells(it, p, 0, 0, k, opts) }) }
+  function drawEditing(x, y, s) { var r = ed.rect; seamless(ed.size, x, y, s, function (k) { drawEditingCells(0, 0, k) }); ed.rect = r }
+  function drawBits(bits, n, x, y, s) { seamless(n, x, y, s, function (k) { drawBitsCells(bits, n, 0, 0, k) }) }
+
+  // ── gallery ───────────────────────────────────────────────────────────────
+  // largest square tile that fits the area with every item, or as many items as fit at a readable size
+  function grid(w, h, count) {
+    var best = { cols: 1, rows: 1, s: Math.min(w, h) }
+    for (var cols = 1; cols <= count; cols++) {
+      var s = w / cols, rows = Math.ceil(count / cols)
+      if (rows * s > h) s = h / rows
+      if (s > best.s || best.cols === 1 && cols === 1) best = { cols: cols, rows: rows, s: s }
+      if (s < best.s && rows * s <= h) break
+    }
+    var minS = Math.max(18, Math.min(w, h) / 60)
+    if (best.s < minS) {
+      var c2 = Math.floor(w / minS), r2 = Math.floor(h / minS)
+      best = { cols: c2, rows: r2, s: Math.min(w / c2, h / r2) }
+    }
+    return best
+  }
+  function drawMosaic(x, y, w, h, cur) {
+    var g = grid(w, h, items.length)
+    fitCount = Math.min(items.length, g.cols * g.rows)
+    var gap = Math.max(1, Math.round(g.s * 0.06))
+    var ox = x + (w - g.cols * g.s) / 2, oy = y + (h - g.rows * g.s) / 2
+    var key = [items.length, items[0] && items[0].ts, visitors.length, Math.round(w), Math.round(h)].join(':')
+    if (key !== mosaicKey) {
+      mosaicLayer = document.createElement('canvas')
+      mosaicLayer.width = Math.ceil(w); mosaicLayer.height = Math.ceil(h)
+      var m = mosaicLayer.getContext('2d')
+      m.imageSmoothingEnabled = false
+      for (var i = 0; i < fitCount; i++) {
+        var tx = ox - x + (i % g.cols) * g.s, ty = oy - y + Math.floor(i / g.cols) * g.s
+        m.drawImage(tileFor(items[i]), Math.round(tx + gap / 2), Math.round(ty + gap / 2), Math.round(g.s - gap), Math.round(g.s - gap))
+        if (items[i].kind === 'visitor') {
+          m.fillStyle = GLOW
+          m.fillRect(Math.round(tx + gap / 2), Math.round(ty + gap / 2), Math.max(3, g.s * 0.14), Math.max(3, g.s * 0.14))
+        }
+      }
+      mosaicKey = key
+    }
+    ctx.drawImage(mosaicLayer, x, y)
+    if (cur && cur.idx >= 0 && cur.idx < fitCount) {
+      var cx = ox + (cur.idx % g.cols) * g.s, cy = oy + Math.floor(cur.idx / g.cols) * g.s
+      var pulse = 0.55 + 0.45 * Math.sin(Date.now() / 260)
+      ctx.fillStyle = 'rgba(14,15,16,0.55)'
+      ctx.fillRect(cx + gap / 2, cy + gap / 2, g.s - gap, g.s - gap)
+      // the tile fills in as the canvas finishes
+      if (cur.p > 0.78) {
+        ctx.save(); ctx.globalAlpha = seg(cur.p, 0.78, 0.9)
+        ctx.imageSmoothingEnabled = false
+        ctx.drawImage(tileFor(cur.it), cx + gap / 2, cy + gap / 2, g.s - gap, g.s - gap)
+        ctx.restore()
+      }
+      ctx.strokeStyle = GLOW; ctx.globalAlpha = pulse; ctx.lineWidth = Math.max(3, g.s * 0.1)
+      ctx.strokeRect(cx + gap / 2, cy + gap / 2, g.s - gap, g.s - gap)
+      ctx.globalAlpha = 1
+    }
+  }
+
+  // ── layouts ───────────────────────────────────────────────────────────────
+  function renderWall(cur) {
+    var u = Math.min(W / 16, H / 9) // one unit of a 16:9 frame, so type scales on any wall
+    var pad = u * 0.45
+    var leftW = Math.min(H - pad * 2, W * 0.42)
+    var px0 = pad, py0 = pad, pw = leftW, ph = H - pad * 2
+    editorPanel(cur, px0, py0, pw, ph, u)
+    // gallery
+    var gx = px0 + pw + pad, gy = pad, gw = W - gx - pad, gh = H - pad * 2
+    ctx.fillStyle = PAPER; ctx.fillRect(gx, gy, gw, gh)
+    var inner = Math.max(4, u * 0.1)
+    ctx.fillStyle = INK; ctx.fillRect(gx + inner, gy + inner, gw - inner * 2, gh - inner * 2)
+    var head = u * 0.5
+    var hw = gw - inner * 2 - u * 0.4
+    var right = onchain.length + ' NORMIES REPAINTED ON ETHEREUM · LIVE'
+    var hs = Math.min(fit('THE NORMIES WALL', hw * 0.4, u * 0.2, 700), fit(right, hw * 0.55, u * 0.2, 600))
+    text('THE NORMIES WALL', gx + inner + u * 0.2, gy + inner + head * 0.7, hs, PAPER, 'left', 700)
+    text(right, gx + gw - inner - u * 0.2, gy + inner + head * 0.7, hs * 0.85, 'rgba(227,229,228,0.55)', 'right', 600)
+    drawMosaic(gx + inner + u * 0.12, gy + inner + head, gw - inner * 2 - u * 0.24, gh - inner * 2 - head - u * 0.12, cur)
+  }
+  // ── the editor: replaying on its own, or painted by a visitor with the mouse ─────────────────
+  var HITS = [] // clickable regions this frame: { x, y, w, h, fn }
+  var ed = null // the visitor's session, or null while the canvas replays the wall
+  var notice = null // { msg, t0 }
+  var FINE = window.matchMedia && matchMedia('(any-pointer: fine)').matches
+  function hit(x, y, w, h, fn) { HITS.push({ x: x, y: y, w: w, h: h, fn: fn }) }
+  function btnW(label, fs) {
+    ctx.font = '700 ' + fs + 'px ' + FONT
+    return ctx.measureText(label).width + label.length * fs * 0.1 + fs * 1.3
+  }
+  function button(label, x, y, h, fs, on, fn, color) {
+    var w = btnW(label, fs)
+    if (on) { ctx.fillStyle = color || PAPER; ctx.fillRect(x, y, w, h) }
+    else if (fn) { ctx.strokeStyle = 'rgba(227,229,228,0.18)'; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1) }
+    text(label, x + fs * 0.65, y + h * 0.7, fs, on ? INK : fn ? 'rgba(227,229,228,0.8)' : 'rgba(227,229,228,0.45)', 'left', 700, fs * 0.1)
+    if (fn) hit(x, y, w, h, fn)
+    return w
+  }
+  // every visitor starts on a blank 40x40; RANDOM brings in a Normie to repaint instead
+  function startEditing() {
+    ed = { size: 40, start: new Uint8Array(1600), bits: new Uint8Array(1600), from: '', grid: false, diff: false,
+      undo: [], redo: [], last: Date.now(), down: false, prev: -1, val: 1, saving: false, rect: null, loading: false }
+  }
+  function useNormie(id, bits) {
+    if (!ed) return
+    snapshot()
+    ed.start = new Uint8Array(bits); ed.bits = new Uint8Array(bits)
+    ed.from = 'NORMIE #' + id; ed.diff = true; ed.loading = false
+  }
+  function randomNormie() {
+    if (!ed || ed.loading) return
+    ed.loading = true
+    var tries = 0
+    ;(function attempt() {
+      var id = Math.floor(Math.random() * 10000)
+      fetch(API + '/normie/' + id + '/pixels').then(function (r) { return r.ok ? r.text() : '' }).then(function (t) {
+        t = (t || '').trim()
+        if (/^[01]{1600}$/.test(t)) {
+          var b = new Uint8Array(1600)
+          for (var i = 0; i < 1600; i++) b[i] = t.charCodeAt(i) === 49 ? 1 : 0
+          return useNormie(id, b)
+        }
+        throw new Error('skip') // burned, or a canvas larger than 40x40
+      }).catch(function (err) {
+        // a burned or enlarged Normie: roll again; the API out of reach: use one from the wall
+        if (err && err.message === 'skip' && ++tries < 6) return attempt()
+        // offline: fall back to a Normie already on the wall
+        var pool = onchain.filter(function (o) { return o.size === 40 })
+        if (pool.length) { var o = pool[Math.floor(Math.random() * pool.length)]; useNormie(o.id, o.nowBits) } else if (ed) ed.loading = false
+      })
+    })()
+  }
+  function changedCount() {
+    if (!ed) return 0
+    var c = 0
+    for (var i = 0; i < ed.bits.length; i++) if (ed.bits[i] !== ed.start[i]) c++
+    return c
+  }
+  function snapshot() { ed.undo.push(new Uint8Array(ed.bits)); if (ed.undo.length > 60) ed.undo.shift(); ed.redo = [] }
+  function undo() { if (ed.undo.length) { ed.redo.push(new Uint8Array(ed.bits)); ed.bits = ed.undo.pop() } }
+  function redo() { if (ed.redo.length) { ed.undo.push(new Uint8Array(ed.bits)); ed.bits = ed.redo.pop() } }
+  function fill(i) {
+    var n = ed.size, from = ed.bits[i], to = from ? 0 : 1, stack = [i]
+    while (stack.length) {
+      var k = stack.pop()
+      if (ed.bits[k] !== from) continue
+      ed.bits[k] = to
+      var x = k % n, y = (k / n) | 0
+      if (x > 0) stack.push(k - 1)
+      if (x < n - 1) stack.push(k + 1)
+      if (y > 0) stack.push(k - n)
+      if (y < n - 1) stack.push(k + n)
+    }
+  }
+  function paintLine(a, b, v) {
+    var n = ed.size, x0 = a % n, y0 = (a / n) | 0, x1 = b % n, y1 = (b / n) | 0
+    var dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy
+    for (;;) {
+      ed.bits[y0 * n + x0] = v
+      if (x0 === x1 && y0 === y1) break
+      var e2 = 2 * err
+      if (e2 >= dy) { err += dy; x0 += sx }
+      if (e2 <= dx) { err += dx; y0 += sy }
+    }
+  }
+  function cellAt(x, y) {
+    var r = ed && ed.rect
+    if (!r || x < r.x || y < r.y || x >= r.x + r.s || y >= r.y + r.s) return -1
+    var n = ed.size
+    return Math.floor((y - r.y) / (r.s / n)) * n + Math.floor((x - r.x) / (r.s / n))
+  }
+  function submit() {
+    if (!ed || ed.saving) return
+    if (changedCount() === 0) { ed = null; return }
+    ed.saving = true
+    var d = bitsToB64u(ed.bits), base = ed.start
+    var it = visitorItem(d, Date.now() / 1000, base)
+    ed = null
+    // a visitor's drawing is shown back once on this screen; the grids stay on-chain Normies only
+    if (it) { it.local = true; spotlight = { it: it, t0: Date.now() } }
+    notice = { msg: 'THANKS FOR PAINTING', t0: Date.now() }
+  }
+  function editorPanel(cur, px0, py0, pw, ph, u) {
+    ctx.fillStyle = PANEL; ctx.fillRect(px0, py0, pw, ph)
+    var bar = u * 0.62, fs = u * 0.19, bh = bar * 0.56, by = py0 + bar * 0.22
+    var tools = ed
+      ? [['UNDO', false, undo], ['REDO', false, redo], ['|'],
+         ['DIFF', ed.diff, function () { ed.diff = !ed.diff }], ['GRID', ed.grid, function () { ed.grid = !ed.grid }], ['|'],
+         ['BLANK', false, function () { snapshot(); ed.start = new Uint8Array(1600); ed.bits = new Uint8Array(1600); ed.from = ''; ed.diff = false }],
+         [ed.loading ? 'LOADING…' : 'RANDOM NORMIE', false, randomNormie]]
+      : [['DRAW', true], ['FILL'], ['UNDO'], ['REDO'], ['|'], ['DIFF', cur.p < 0.82], ['GRID'], ['REF']]
+    ctx.font = '700 ' + fs + 'px ' + FONT
+    var need = tools.reduce(function (a, t) { return a + (t[0] === '|' ? u * 0.12 : btnW(t[0], fs) + fs * 0.3) }, 0) + u * 1.0
+    if (need > pw - u * 0.44) fs *= (pw - u * 0.44) / need
+    var tx = px0 + u * 0.22
+    tools.forEach(function (t) {
+      if (t[0] === '|') { tx += u * 0.12; return }
+      tx += button(t[0], tx, by, bh, fs, !!t[1], ed ? function () { ed.last = Date.now(); t[2]() } : null) + fs * 0.3
+    })
+    var size = ed ? ed.size : cur.it.size
+    text(size + '×' + size, px0 + pw - u * 0.22, py0 + bar * 0.62, fs, 'rgba(227,229,228,0.45)', 'right', 600)
+    var cap = u * 0.85
+    var s = Math.min(pw - u * 0.44, ph - bar - cap)
+    var cx = px0 + (pw - s) / 2, cy = py0 + bar
+    if (ed) {
+      ed.rect = { x: cx, y: cy, s: s }
+      drawEditing(cx, cy, s)
+      var left = Math.max(0, Math.ceil((IDLE_MS - (Date.now() - ed.last)) / 1000))
+      var n = changedCount()
+      text('YOUR TURN', cx, cy + s + cap * 0.38, u * 0.26, ADD, 'left', 700, u * 0.03)
+      var info = (ed.from ? 'REPAINTING ' + ed.from : 'BLANK CANVAS') + ' · CLICK A PIXEL TO ADD OR REMOVE IT · ' + n + ' CHANGED' + (left <= 15 ? ' · SAVING IN ' + left : '')
+      text(info, cx, cy + s + cap * 0.72, fit(info, s * 0.5, u * 0.15, 600), 'rgba(227,229,228,0.6)', 'left', 600)
+      var bfs = u * 0.2, bhh = cap * 0.5, bx = cx + s
+      var w1 = btnW('DONE', bfs)
+      button('DONE', bx - w1, cy + s + cap * 0.18, bhh, bfs, true, submit, GLOW)
+      var w2 = btnW('CANCEL', bfs)
+      button('CANCEL', bx - w1 - w2 - bfs * 0.6, cy + s + cap * 0.18, bhh, bfs, false, function () { ed = null })
+    } else {
+      drawReplay(cur.it, cur.p, cx, cy, s, { grid: false })
+      text(nameOf(cur.it), cx, cy + s + cap * 0.38, u * 0.28, PAPER, 'left', 700, u * 0.02)
+      var line = lineOf(cur.it)
+      text(line, cx, cy + s + cap * 0.7, fit(line, s, u * 0.16, 600), 'rgba(227,229,228,0.6)', 'left', 600)
+      if (FINE || mouseSeen) {
+        var a = 0.55 + 0.45 * Math.sin(Date.now() / 400)
+        ctx.save(); ctx.globalAlpha = a
+        var hint = 'CLICK THE CANVAS TO PAINT'
+        text(hint, cx + s, cy + s + cap * 0.38, fit(hint, s * 0.45, u * 0.17, 700), GLOW, 'right', 700, u * 0.02)
+        ctx.restore()
+      }
+      hit(cx, cy, s, s, function () { startEditing(cur) })
+    }
+  }
+  function drawEditingCells(x, y, s) {
+    var n = ed.size, px = s / n
+    ctx.fillStyle = PAPER; ctx.fillRect(x, y, s, s)
+    for (var i = 0; i < n * n; i++) {
+      var on = ed.bits[i], was = ed.start[i]
+      if (!on) continue // a removed pixel is simply empty
+      var cx = x + (i % n) * px, cy = y + ((i / n) | 0) * px
+      if (ed.diff && on && !was) ctx.fillStyle = ADD
+      else if (ed.diff && !on && was) {
+        ctx.fillStyle = DEL
+        var inset = px * 0.3
+        ctx.fillRect(Math.floor(cx + inset), Math.floor(cy + inset), Math.ceil(px - inset * 2), Math.ceil(px - inset * 2))
+        continue
+      } else ctx.fillStyle = STEEL
+      ctx.fillRect(Math.floor(cx), Math.floor(cy), Math.ceil(px), Math.ceil(px))
+    }
+    if (ed.grid && px >= 5) {
+      ctx.strokeStyle = 'rgba(14,15,16,0.1)'; ctx.lineWidth = 1
+      ctx.beginPath()
+      for (var g = 1; g < n; g++) {
+        ctx.moveTo(Math.round(x + g * px) + 0.5, y); ctx.lineTo(Math.round(x + g * px) + 0.5, y + s)
+        ctx.moveTo(x, Math.round(y + g * px) + 0.5); ctx.lineTo(x + s, Math.round(y + g * px) + 0.5)
+      }
+      ctx.stroke()
+    }
+    if (hover >= 0) {
+      ctx.strokeStyle = ed.bits[hover] ? DEL : ADD
+      ctx.lineWidth = Math.max(2, px * 0.12)
+      ctx.strokeRect(x + (hover % n) * px, y + ((hover / n) | 0) * px, px, px)
+    }
+  }
+  function drawNotice() {
+    if (!notice) return
+    var t = (Date.now() - notice.t0) / 2600
+    if (t >= 1) { notice = null; return }
+    var m = Math.min(W, H), fs = m * 0.045
+    ctx.save(); ctx.globalAlpha = Math.min(1, (1 - t) * 3)
+    ctx.font = '700 ' + fs + 'px ' + FONT
+    var w = ctx.measureText(notice.msg).width + fs * 2
+    var ny = H / 2 - fs
+    ctx.fillStyle = GLOW; ctx.fillRect((W - w) / 2, ny, w, fs * 1.9)
+    text(notice.msg, W / 2, ny + fs * 1.3, fs, INK, 'center', 700, fs * 0.1)
+    ctx.restore()
+  }
+
+  // ── pointer: one mouse (or a finger) is enough to paint ──
+  var mouseSeen = false, hover = -1
+  function pos(e) { var r = cv.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top } }
+  cv.addEventListener('contextmenu', function (e) { e.preventDefault() })
+  cv.addEventListener('pointerdown', function (e) {
+    mouseSeen = true
+    var p = pos(e)
+    if (ed) {
+      ed.last = Date.now()
+      var i = cellAt(p.x, p.y)
+      if (i >= 0) {
+        snapshot()
+        // one action: a filled pixel is removed, an empty one filled; dragging keeps doing the same
+        ed.val = ed.bits[i] ? 0 : 1
+        ed.bits[i] = ed.val
+        ed.down = true; ed.prev = i
+        try { cv.setPointerCapture(e.pointerId) } catch (_) {}
+        return
+      }
+    }
+    for (var k = HITS.length - 1; k >= 0; k--) {
+      var h = HITS[k]
+      if (p.x >= h.x && p.y >= h.y && p.x <= h.x + h.w && p.y <= h.y + h.h) { h.fn(); return }
+    }
+    // a click anywhere else on a screen that shows no editor opens one
+    if (!ed && items.length && layout() !== 'wall') startEditing(now())
+  })
+  cv.addEventListener('pointermove', function (e) {
+    mouseSeen = true
+    var p = pos(e)
+    hover = ed ? cellAt(p.x, p.y) : -1
+    cv.style.cursor = ed && hover >= 0 ? 'crosshair' : 'default'
+    if (!ed || !ed.down) return
+    ed.last = Date.now()
+    var i = cellAt(p.x, p.y)
+    if (i >= 0 && i !== ed.prev) { paintLine(ed.prev >= 0 ? ed.prev : i, i, ed.val); ed.prev = i }
+  })
+  function up() { if (ed) { ed.down = false; ed.prev = -1 } }
+  cv.addEventListener('pointerup', up)
+  cv.addEventListener('pointercancel', up)
+  window.addEventListener('keydown', function (e) {
+    if (!ed) return
+    ed.last = Date.now()
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') { e.shiftKey ? redo() : undo(); e.preventDefault() }
+    else if (e.key === 'Escape') ed = null
+    else if (e.key === 'Enter') submit()
+  })
+  // someone walked away: keep what they made, drop an untouched canvas
+  setInterval(function () {
+    if (ed && !ed.down && Date.now() - ed.last > IDLE_MS) { if (changedCount() > 0) submit(); else ed = null }
+  }, 1000)
+
+  function drawBitsCells(bits, n, x, y, s) {
+    var px = s / n
+    ctx.fillStyle = PAPER; ctx.fillRect(x, y, s, s)
+    ctx.fillStyle = STEEL
+    for (var i = 0; i < bits.length; i++) if (bits[i]) ctx.fillRect(Math.floor(x + (i % n) * px), Math.floor(y + ((i / n) | 0) * px), Math.ceil(px), Math.ceil(px))
+  }
+  // one Normie, full size, with a label over it and a line under it
+  function renderSingle(cur, which) {
+    var m = Math.min(W, H)
+    var head = m * 0.07, cap = m * 0.06
+    var s = Math.min(W * 0.86, H - head - cap - m * 0.06)
+    var x = (W - s) / 2, y = (H - s - head - cap) / 2 + head
+    var it = cur.it, fs = m * 0.03
+    if (which === 'before') drawBits(it.baseBits, it.size, x, y, s)
+    else if (which === 'after') drawBits(it.nowBits, it.size, x, y, s)
+    else drawReplay(it, cur.p, x, y, s, { grid: false })
+    var label = which === 'before' ? 'BEFORE' : which === 'after' ? (it.kind === 'visitor' ? 'DONE' : 'ON ETHEREUM') : 'REPAINTING'
+    var dot = which === 'before' ? 'rgba(227,229,228,0.55)' : which === 'after' ? PAPER : ADD
+    ctx.fillStyle = dot; ctx.fillRect(x, y - head * 0.62, fs * 0.6, fs * 0.6)
+    text(label, x + fs, y - head * 0.38, fs, PAPER, 'left', 700, fs * 0.12)
+    text(nameOf(it), x + s, y - head * 0.38, fs, 'rgba(227,229,228,0.6)', 'right', 700, fs * 0.06)
+    var n = it.changes.length
+    var line = which === 'before' ? (it.kind === 'visitor' && !it.local ? 'A BLANK CANVAS' : 'THE ART AS IT WAS')
+      : which === 'after' ? n + ' PIXEL' + (n === 1 ? '' : 'S') + (it.kind === 'visitor' ? ' · DRAWN HERE · ' : ' REPAINTED · ') + ago(it.ts)
+      : Math.floor(n * seg(cur.p, 0.08, 0.62)) + ' / ' + n + ' PIXELS'
+    text(line, x, y + s + cap * 0.75, fs * 0.8, 'rgba(227,229,228,0.55)', 'left', 600, fs * 0.05)
+    text('NORMIES.ART', x + s, y + s + cap * 0.75, fs * 0.8, 'rgba(227,229,228,0.35)', 'right', 600, fs * 0.08)
+  }
+  function renderMosaic(cur) {
+    var pad = Math.min(W, H) * 0.03
+    drawMosaic(pad, pad, W - pad * 2, H - pad * 2, cur)
+  }
+
+  // ── loop ──────────────────────────────────────────────────────────────────
+  function resize() {
+    W = window.innerWidth; H = window.innerHeight
+    // sharp on retina screens, but never past the browser's canvas limits on the 8,640-wide wall
+    DPR = Math.min(window.devicePixelRatio || 1, 2, 16000 / W, 16000 / H, Math.sqrt(2.4e8 / (W * H)))
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR)
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0)
+    mosaicKey = ''
+  }
+  function frame() {
+    HITS = []
+    ctx.fillStyle = INK; ctx.fillRect(0, 0, W, H)
+    if (ed && layout() !== 'wall') {
+      var m = Math.min(W, H), u = Math.min(W / 9, H / 10)
+      var pw = Math.min(W - m * 0.06, (H - m * 0.06) * 0.9)
+      editorPanel(now(), (W - pw) / 2, m * 0.03, pw, H - m * 0.06, u)
+    } else if (!items.length) {
+      text('NORMIES', W / 2, H / 2, Math.min(W, H) * 0.06, 'rgba(227,229,228,0.35)', 'center', 700, Math.min(W, H) * 0.01)
+    } else {
+      var mode = layout()
+      var cur = now()
+      if (mode === 'wall') renderWall(cur)
+      else if (mode === 'mosaic') renderMosaic(cur)
+      else renderSingle(cur, mode)
+    }
+    drawNotice()
+    requestAnimationFrame(frame)
+  }
+  window.addEventListener('resize', resize)
+  resize()
+  load()
+  setInterval(load, 60000)
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { mosaicKey = '' })
+  requestAnimationFrame(frame)
+  window.__occupy = { accept: accept, layout: layout }
+})()
+</script>
+</body>
+</html>

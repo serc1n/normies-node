@@ -1,0 +1,11 @@
+node_modules/
+.vercel/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+push.log
+
+# local helper scripts stay off GitHub
+*.command

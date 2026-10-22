@@ -1,0 +1,13 @@
+{
+  "name": "normies-node",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Normies Canvas, a live installation for NODE Foundation's OCCUPY (Exhibition 1).",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
