@@ -21,6 +21,7 @@ canvas { display: block; width: 100vw; height: 100vh; }
   var Q = new URLSearchParams(location.search)
   var SURFACE = (Q.get('surface') || '').toLowerCase()
   var DATA_URL = Q.get('data') || '/api/occupy'
+  var LIVE_URL = Q.get('live') || '/api/occupy/live' // the painting at the wall, and what was painted at NODE
   var API = Q.get('api') || 'https://api.normies.art' // for RANDOM: any of the living Normies
   var IDLE_MS = 60000 // a visitor who walks away: their drawing is filed (or dropped if empty)
   var CYCLE = Number(Q.get('cycle')) || 12000 // ms per Normie; every surface shares the clock
@@ -41,16 +42,17 @@ canvas { display: block; width: 100vw; height: 100vh; }
   // before → being repainted → on chain → every Normie repainted.
   //   wall: canvas replay + gallery · before: the art as it was · focus: the replay ·
   //   after: the art as it lives on chain · mosaic: the whole gallery
-  // The cube: side 1 the Legendary Canvases, side 2 customized Normies being repainted, sides 3 and
-  // 4 open canvases for visitors to paint live.
-  var MODES = { wall: 1, before: 1, focus: 1, after: 1, mosaic: 1, legendary: 1, paint: 1 }
+  // Visitors paint at the entrance wall. The cube: side 1 the Legendary Canvases, side 2 customized
+  // Normies being repainted, side 3 the wall's painting live, side 4 what was painted at NODE.
+  var MODES = { wall: 1, before: 1, focus: 1, after: 1, mosaic: 1, legendary: 1, live: 1, recent: 1 }
   function layout() {
     var forced = (Q.get('mode') || '').toLowerCase()
     if (MODES[forced]) return forced
     if (SURFACE === 'entrance-led') return 'wall'
     if (SURFACE === 'cube-1') return 'legendary'
     if (SURFACE === 'cube-2') return 'focus'
-    if (SURFACE === 'cube-3' || SURFACE === 'cube-4') return 'paint'
+    if (SURFACE === 'cube-3') return 'live'
+    if (SURFACE === 'cube-4') return 'recent'
     return W / H >= 1.4 ? 'wall' : 'focus'
   }
 
@@ -122,6 +124,69 @@ canvas { display: block; width: 100vw; height: 100vh; }
     }
     return btoa(out).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
   }
+  function bitsToHex(bits) {
+    var out = ''
+    for (var i = 0; i < bits.length; i += 4) out += ((bits[i] << 3) | (bits[i + 1] << 2) | (bits[i + 2] << 1) | bits[i + 3]).toString(16)
+    return out
+  }
+
+  // ── live state shared between the wall and the cube ──────────────────────────────────────────
+  // The wall sends its canvas while someone paints (and when they finish); the cube reads it. Same
+  // computer: a BroadcastChannel delivers it at once. Otherwise /api/occupy/live relays it.
+  var bc = null
+  try { bc = new BroadcastChannel('normies-occupy') } catch (_) {}
+  var liveState = null, liveSeen = 0, liveTs = 0, recent = [], recentKey = ''
+  function takeLive(l) {
+    if (!l || !l.bits) { liveState = null; return }
+    if (l.ts !== liveTs) { liveTs = l.ts; liveSeen = Date.now() }
+    liveState = { bits: hexBits(l.bits, 40), start: hexBits(l.start || '', 40) }
+  }
+  function takeRecent(list) {
+    if (!Array.isArray(list)) return
+    var key = list.length + ':' + (list[0] && list[0].ts)
+    if (key === recentKey) return
+    recentKey = key
+    recent = list.filter(function (r) { return r && r.bits }).map(function (r) {
+      var it = { kind: 'node', id: 'n' + r.ts, ts: r.ts / 1000, size: 40, nowBits: hexBits(r.bits, 40) }
+      return it
+    })
+    mosaicKey = ''
+  }
+  if (bc) bc.onmessage = function (e) {
+    var m = e.data || {}
+    if (m.type === 'live') takeLive({ bits: m.bits, start: m.start, ts: Date.now() })
+    else if (m.type === 'idle') liveState = null
+    else if (m.type === 'done') { liveState = null; pollLive() }
+  }
+  function pollLive() {
+    fetch(LIVE_URL, { cache: 'no-store' }).then(function (r) { return r.ok ? r.json() : null }).then(function (d) {
+      if (!d) return
+      takeLive(d.live)
+      takeRecent(d.recent)
+    }).catch(function () {})
+  }
+  function send(msg) {
+    if (bc) try { bc.postMessage(msg) } catch (_) {}
+    fetch(LIVE_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(msg), keepalive: true }).catch(function () {})
+  }
+  var sent = { key: '', at: 0 }
+  // called every frame on the wall: send the canvas when it changed (at most ~3 times a second),
+  // and a heartbeat every 5 s so the cube knows someone is still there
+  function publish() {
+    if (!ed) return
+    var key = bitsToHex(ed.bits), t = Date.now()
+    if ((key !== sent.key && t - sent.at > 330) || t - sent.at > 5000) {
+      sent = { key: key, at: t }
+      send({ type: 'live', bits: key, start: bitsToHex(ed.start) })
+    }
+  }
+  function endSession(done) {
+    if (!ed) return
+    var msg = done ? { type: 'done', bits: bitsToHex(ed.bits), start: bitsToHex(ed.start) } : { type: 'idle' }
+    sent = { key: '', at: 0 }
+    send(msg)
+  }
+
   function hashStr(str) {
     var h = 2166136261
     for (var i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0 }
@@ -437,8 +502,9 @@ canvas { display: block; width: 100vw; height: 100vh; }
   }
   function submit() {
     if (!ed || ed.saving) return
-    if (changedCount() === 0) { ed = null; return }
+    if (changedCount() === 0) { endSession(false); ed = null; return }
     ed.saving = true
+    endSession(true)
     var d = bitsToB64u(ed.bits), base = ed.start
     var it = visitorItem(d, Date.now() / 1000, base)
     ed = null
@@ -480,7 +546,7 @@ canvas { display: block; width: 100vw; height: 100vh; }
       var w1 = btnW('DONE', bfs)
       button('DONE', bx - w1, cy + s + cap * 0.18, bhh, bfs, true, submit, GLOW)
       var w2 = btnW('CANCEL', bfs)
-      button('CANCEL', bx - w1 - w2 - bfs * 0.6, cy + s + cap * 0.18, bhh, bfs, false, function () { ed = null })
+      button('CANCEL', bx - w1 - w2 - bfs * 0.6, cy + s + cap * 0.18, bhh, bfs, false, function () { endSession(false); ed = null })
     } else {
       drawReplay(cur.it, cur.p, cx, cy, s, { grid: false })
       text(nameOf(cur.it), cx, cy + s + cap * 0.38, u * 0.28, PAPER, 'left', 700, u * 0.02)
@@ -493,7 +559,7 @@ canvas { display: block; width: 100vw; height: 100vh; }
         text(hint, cx + s, cy + s + cap * 0.38, fit(hint, s * 0.45, u * 0.17, 700), GLOW, 'right', 700, u * 0.02)
         ctx.restore()
       }
-      hit(cx, cy, s, s, function () { startEditing(cur) })
+      if (layout() === 'wall') hit(cx, cy, s, s, function () { startEditing(cur) })
     }
   }
   function drawEditingCells(x, y, s) {
@@ -565,8 +631,6 @@ canvas { display: block; width: 100vw; height: 100vh; }
       var h = HITS[k]
       if (p.x >= h.x && p.y >= h.y && p.x <= h.x + h.w && p.y <= h.y + h.h) { h.fn(); return }
     }
-    // a click anywhere else on a screen that shows no editor opens one
-    if (!ed && items.length && layout() !== 'wall' && layout() !== 'legendary') startEditing(now())
   })
   cv.addEventListener('pointermove', function (e) {
     mouseSeen = true
@@ -585,12 +649,12 @@ canvas { display: block; width: 100vw; height: 100vh; }
     if (!ed) return
     ed.last = Date.now()
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') { e.shiftKey ? redo() : undo(); e.preventDefault() }
-    else if (e.key === 'Escape') ed = null
+    else if (e.key === 'Escape') { endSession(false); ed = null }
     else if (e.key === 'Enter') submit()
   })
   // someone walked away: keep what they made, drop an untouched canvas
   setInterval(function () {
-    if (ed && !ed.down && Date.now() - ed.last > IDLE_MS) { if (changedCount() > 0) submit(); else ed = null }
+    if (ed && !ed.down && Date.now() - ed.last > IDLE_MS) { if (changedCount() > 0) submit(); else { endSession(false); ed = null } }
   }, 1000)
 
   function drawBitsCells(bits, n, x, y, s) {
@@ -650,6 +714,87 @@ canvas { display: block; width: 100vw; height: 100vh; }
     ctx.restore()
     text('NORMIES.ART', x + s, y + s + foot * 0.85, fs * 0.8, 'rgba(227,229,228,0.35)', 'right', 600, fs * 0.08)
   }
+  // cube-3: the canvas being painted at the entrance wall, pixel for pixel
+  function renderLive() {
+    var m = Math.min(W, H), fs = m * 0.032
+    var head = m * 0.08, foot = m * 0.1
+    var s = Math.min(W * 0.84, H - head - foot - m * 0.04)
+    var x = (W - s) / 2, y = (H - s - head - foot) / 2 + head
+    var on = liveState && Date.now() - liveSeen < 12000
+    if (on) {
+      var L = liveState
+      seamless(40, x, y, s, function (k) {
+        var px = k / 40
+        ctx.fillStyle = PAPER; ctx.fillRect(0, 0, k, k)
+        for (var i = 0; i < 1600; i++) {
+          if (!L.bits[i]) continue
+          ctx.fillStyle = L.start[i] ? STEEL : ADD
+          ctx.fillRect((i % 40) * px, ((i / 40) | 0) * px, px, px)
+        }
+      })
+      var n = 0
+      for (var i = 0; i < 1600; i++) if (L.bits[i] !== L.start[i]) n++
+      var pulse = 0.5 + 0.5 * Math.sin(Date.now() / 300)
+      ctx.save(); ctx.globalAlpha = pulse; ctx.fillStyle = '#ff4d4d'
+      ctx.beginPath(); ctx.arc(x + fs * 0.3, y - head * 0.62 + fs * 0.3, fs * 0.32, 0, Math.PI * 2); ctx.fill(); ctx.restore()
+      text('LIVE', x + fs, y - head * 0.38, fs, PAPER, 'left', 700, fs * 0.12)
+      text('ENTRANCE WALL', x + s, y - head * 0.38, fs, 'rgba(227,229,228,0.55)', 'right', 700, fs * 0.08)
+      text('SOMEONE IS PAINTING NOW', x, y + s + foot * 0.6, fs * 0.8, 'rgba(227,229,228,0.6)', 'left', 600, fs * 0.06)
+      text(n + ' PIXEL' + (n === 1 ? '' : 'S'), x + s, y + s + foot * 0.6, fs * 0.8, ADD, 'right', 700, fs * 0.06)
+      return
+    } else {
+      // nobody painting: the latest piece made here, dimmed, and an invitation
+      ctx.save(); ctx.globalAlpha = 0.18
+      if (recent[0]) drawBits(recent[0].nowBits, 40, x, y, s)
+      else { ctx.fillStyle = PAPER; ctx.fillRect(x, y, s, s) }
+      ctx.restore()
+      ctx.strokeStyle = 'rgba(227,229,228,0.25)'; ctx.lineWidth = 2; ctx.strokeRect(x + 1, y + 1, s - 2, s - 2)
+      ctx.fillStyle = 'rgba(227,229,228,0.4)'; ctx.fillRect(x, y - head * 0.62, fs * 0.6, fs * 0.6)
+      text('LIVE', x + fs, y - head * 0.38, fs, 'rgba(227,229,228,0.55)', 'left', 700, fs * 0.12)
+      var a = 0.6 + 0.4 * Math.sin(Date.now() / 500)
+      ctx.save(); ctx.globalAlpha = a
+      text('PAINT AT THE ENTRANCE WALL', W / 2, y + s / 2, fit('PAINT AT THE ENTRANCE WALL', s * 0.86, m * 0.05, 700), PAPER, 'center', 700, m * 0.004)
+      ctx.restore()
+      text('YOUR PAINTING SHOWS HERE, LIVE', W / 2, y + s / 2 + m * 0.06, fs * 0.85, 'rgba(227,229,228,0.6)', 'center', 600, fs * 0.06)
+    }
+    text('NORMIES.ART', x + s, y + s + foot * 0.6, fs * 0.8, 'rgba(227,229,228,0.35)', 'right', 600, fs * 0.08)
+  }
+  // cube-4: every drawing finished at NODE, newest first and lit
+  var recentLayer = null, recentLayerKey = ''
+  function renderRecent() {
+    var m = Math.min(W, H), fs = m * 0.032
+    var head = m * 0.08, pad = m * 0.05
+    var x = pad, y = pad + head, w = W - pad * 2, h = H - pad * 2 - head
+    ctx.fillStyle = GLOW; ctx.fillRect(x, y - head * 0.62, fs * 0.6, fs * 0.6)
+    text('PAINTED AT NODE', x + fs, y - head * 0.38, fs, PAPER, 'left', 700, fs * 0.12)
+    text(recent.length + ' DRAWING' + (recent.length === 1 ? '' : 'S'), x + w, y - head * 0.38, fs, 'rgba(227,229,228,0.55)', 'right', 700, fs * 0.06)
+    if (!recent.length) {
+      ctx.strokeStyle = 'rgba(227,229,228,0.2)'; ctx.lineWidth = 2; ctx.strokeRect(x + 1, y + 1, w - 2, h - 2)
+      text('DRAWINGS MADE AT THE ENTRANCE WALL', W / 2, y + h / 2, fit('DRAWINGS MADE AT THE ENTRANCE WALL', w * 0.86, m * 0.04, 700), 'rgba(227,229,228,0.6)', 'center', 700)
+      text('APPEAR HERE', W / 2, y + h / 2 + m * 0.055, fs, 'rgba(227,229,228,0.45)', 'center', 700, fs * 0.1)
+      return
+    }
+    var g = grid(w, h, recent.length)
+    var count = Math.min(recent.length, g.cols * g.rows)
+    var gap = Math.max(2, Math.round(g.s * 0.05))
+    var ox = (w - g.cols * g.s) / 2, oy = (h - Math.ceil(count / g.cols) * g.s) / 2
+    var key = [recentKey, Math.round(w), Math.round(h)].join(':')
+    if (key !== recentLayerKey) {
+      recentLayer = document.createElement('canvas')
+      recentLayer.width = Math.ceil(w); recentLayer.height = Math.ceil(h)
+      var c = recentLayer.getContext('2d')
+      c.imageSmoothingEnabled = false
+      for (var i = 0; i < count; i++) {
+        c.drawImage(tileFor(recent[i]), Math.round(ox + (i % g.cols) * g.s + gap / 2), Math.round(oy + Math.floor(i / g.cols) * g.s + gap / 2), Math.round(g.s - gap), Math.round(g.s - gap))
+      }
+      recentLayerKey = key
+    }
+    ctx.drawImage(recentLayer, x, y)
+    // the newest one glows
+    var pulse = 0.55 + 0.45 * Math.sin(Date.now() / 260)
+    ctx.save(); ctx.globalAlpha = pulse; ctx.strokeStyle = GLOW; ctx.lineWidth = Math.max(3, Math.min(g.s * 0.06, m * 0.008))
+    ctx.strokeRect(x + ox + gap / 2, y + oy + gap / 2, g.s - gap, g.s - gap); ctx.restore()
+  }
   function renderMosaic(cur) {
     var pad = Math.min(W, H) * 0.03
     drawMosaic(pad, pad, W - pad * 2, H - pad * 2, cur)
@@ -668,10 +813,13 @@ canvas { display: block; width: 100vw; height: 100vh; }
     HITS = []
     ctx.fillStyle = INK; ctx.fillRect(0, 0, W, H)
     var lay = layout()
-    // the paint sides always hold an open canvas, except while a finished drawing replays
-    if (lay === 'paint' && !ed && !spotlight) startEditing()
+    if (lay === 'wall') publish()
     if (lay === 'legendary') {
       renderLegendary()
+    } else if (lay === 'live') {
+      renderLive()
+    } else if (lay === 'recent') {
+      renderRecent()
     } else if (ed && lay !== 'wall') {
       var m = Math.min(W, H), u = Math.min(W / 9, H / 10)
       var pw = Math.min(W - m * 0.06, (H - m * 0.06) * 0.9)
@@ -683,7 +831,7 @@ canvas { display: block; width: 100vw; height: 100vh; }
       var cur = now()
       if (mode === 'wall') renderWall(cur)
       else if (mode === 'mosaic') renderMosaic(cur)
-      else renderSingle(cur, mode === 'paint' ? 'focus' : mode)
+      else renderSingle(cur, mode)
     }
     drawNotice()
     requestAnimationFrame(frame)
@@ -692,6 +840,12 @@ canvas { display: block; width: 100vw; height: 100vh; }
   resize()
   load()
   setInterval(load, 60000)
+  // cube-3 checks often (a painting in progress), cube-4 now and then (finished drawings)
+  ;(function loop() {
+    var lay = layout()
+    if (lay === 'live' || lay === 'recent') pollLive()
+    setTimeout(loop, lay === 'live' ? 1000 : 4000)
+  })()
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { mosaicKey = '' })
   requestAnimationFrame(frame)
   window.__occupy = { accept: accept, layout: layout }
